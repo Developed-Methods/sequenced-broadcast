@@ -2,6 +2,11 @@
 name = "sequenced-broadcast"
 version = "0.1.0"
 edition = "2021"
+authors = ["Patrick Lorio <patrick@methods.dev>"]
+description = "Async structure to allow sequenced broadcasts with history"
+repository = "https://github.com/Developed-Methods/sequenced-broadcast"
+license = "BSD-2-Clause"
+license-file = "LICENSE.txt"
 
 [dependencies]
 tokio = { version = "1.40", features = ["time", "sync", "rt"] }
@@ -11,3 +16,4 @@ tracing = "0.1.40"
 [dev-dependencies]
 tracing-subscriber = "0.3.18"
 tokio = { version = "1.40", features = ["full"] }
+
