@@ -12,7 +12,7 @@ use std::{
 };
 
 use tokio::sync::{
-    mpsc::{channel, error::TrySendError, Receiver, Sender},
+    mpsc::{channel, error::{SendError, TryRecvError, TrySendError}, Permit, Receiver, Sender},
     oneshot,
 };
 use tokio_util::sync::CancellationToken;
@@ -33,6 +33,11 @@ struct NextReq<T> {
 pub struct SequencedSender<T> {
     next_seq: u64,
     send: Sender<(u64, T)>,
+}
+
+pub struct SequencedReceiver<T> {
+    next_seq: u64,
+    receiver: Receiver<(u64, T)>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +61,7 @@ struct Subscriber<T> {
     pending: Option<T>,
 }
 
+#[derive(Debug, Clone)]
 pub struct SequencedBroadcastSettings {
     pub subscriber_channel_len: usize,
     pub lag_start_threshold: u64,
@@ -92,23 +98,51 @@ impl Default for SequencedBroadcastSettings {
 }
 
 impl<T> SequencedSender<T> {
-    pub async fn safe_send(&mut self, seq: u64, item: T) -> Result<(), SequencedSenderError> {
+    pub fn new(next_seq: u64, send: Sender<(u64, T)>) -> Self {
+        SequencedSender { next_seq, send }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.send.is_closed()
+    }
+
+    pub async fn safe_send(&mut self, seq: u64, item: T) -> Result<(), SequencedSenderError<T>> {
         self._send(Some(seq), item).await
     }
 
-    pub async fn send(&mut self, item: T) -> Result<(), SequencedSenderError> {
+    pub async fn send(&mut self, item: T) -> Result<(), SequencedSenderError<T>> {
         self._send(None, item).await
     }
 
-    async fn _send(&mut self, seq: Option<u64>, item: T) -> Result<(), SequencedSenderError> {
+    pub fn try_send(&mut self, item: T) -> Result<(), TrySendError<T>> {
+        match self.send.try_send((self.next_seq, item)) {
+            Ok(()) => {
+                self.next_seq += 1;
+                Ok(())
+            }
+            Err(TrySendError::Full(err)) => Err(TrySendError::Full(err.1)),
+            Err(TrySendError::Closed(err)) => Err(TrySendError::Closed(err.1)),
+        }
+    }
+
+    pub async fn reserve(&mut self) -> Result<SequencedSenderPermit<T>, SendError<()>> {
+        let permit = self.send.reserve().await?;
+
+        Ok(SequencedSenderPermit {
+            next_seq: &mut self.next_seq,
+            permit,
+        })
+    }
+
+    async fn _send(&mut self, seq: Option<u64>, item: T) -> Result<(), SequencedSenderError<T>> {
         if let Some(seq) = seq {
             if seq != self.next_seq {
-                return Err(SequencedSenderError::InvalidSequence(self.next_seq));
+                return Err(SequencedSenderError::InvalidSequence(self.next_seq, item));
             }
         }
 
-        if self.send.send((self.next_seq, item)).await.is_err() {
-            return Err(SequencedSenderError::ChannelClosed);
+        if let Err(error) = self.send.send((self.next_seq, item)).await {
+            return Err(SequencedSenderError::ChannelClosed(error.0.1));
         }
 
         self.next_seq += 1;
@@ -120,10 +154,71 @@ impl<T> SequencedSender<T> {
     }
 }
 
+pub struct SequencedSenderPermit<'a, T> {
+    next_seq: &'a mut u64,
+    permit: Permit<'a, (u64, T)>,
+}
+
+impl<'a, T> SequencedSenderPermit<'a, T> {
+    pub fn send(self, item: T) {
+        let seq = *self.next_seq;
+        self.permit.send((seq, item));
+        *self.next_seq = seq + 1;
+    }
+}
+
+impl<T> SequencedReceiver<T> {
+    pub fn new(next_seq: u64, receiver: Receiver<(u64, T)>) -> Self {
+        SequencedReceiver {
+            next_seq,
+            receiver
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<(u64, T)> {
+        let (seq, action) = self.receiver.recv().await?;
+        if self.next_seq != seq {
+            panic!("expected sequence: {} but got: {}", self.next_seq, seq);
+        }
+        self.next_seq += 1;
+        Some((seq, action))
+    }
+
+    pub fn try_recv(&mut self) -> Result<(u64, T), TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok((seq, action)) => {
+                if self.next_seq != seq {
+                    panic!("expected sequence: {} but got: {}", self.next_seq, seq);
+                }
+                self.next_seq += 1;
+                Ok((seq, action))
+            }
+            Err(error) => Err(error)
+        }
+    }
+
+    pub fn unbundle(self) -> (u64, Receiver<(u64, T)>) {
+        (self.next_seq, self.receiver)
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub enum SequencedSenderError {
-    InvalidSequence(u64),
-    ChannelClosed,
+pub enum SequencedSenderError<T> {
+    InvalidSequence(u64, T),
+    ChannelClosed(T),
+}
+
+impl<T> SequencedSenderError<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::InvalidSequence(_, v) => v,
+            Self::ChannelClosed(v) => v,
+        }
+    }
 }
 
 impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
@@ -186,7 +281,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
         &self,
         next_sequence: u64,
         allow_drop: bool,
-    ) -> Option<Receiver<(u64, T)>> {
+    ) -> Option<SequencedReceiver<T>> {
         let (tx, rx) = oneshot::channel();
 
         self.new_subscriber
@@ -229,7 +324,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
 }
 
 struct NewClient<T> {
-    response: oneshot::Sender<Receiver<(u64, T)>>,
+    response: oneshot::Sender<SequencedReceiver<T>>,
     next_sequence: u64,
     allow_drop: bool,
 }
@@ -321,6 +416,11 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                     /* Send Receiver to subscribers */
                     let (tx, rx) = channel(self.settings.subscriber_channel_len);
+                    let rx = SequencedReceiver::<T> {
+                        receiver: rx,
+                        next_seq: new.next_sequence,
+                    };
+
                     if new.response.send(rx).is_ok() {
                         let sub_id = self.next_sub_id;
                         self.next_sub_id += 1;
@@ -757,9 +857,10 @@ mod test {
             .await
             .unwrap()
             .unwrap();
+
         assert_eq!(
             tx1.send("fail").await,
-            Err(SequencedSenderError::ChannelClosed)
+            Err(SequencedSenderError::ChannelClosed("fail"))
         );
 
         tx2.safe_send(2, "Hehe").await.unwrap();
