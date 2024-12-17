@@ -106,6 +106,10 @@ impl<T> SequencedSender<T> {
         self.send.is_closed()
     }
 
+    pub async fn closed(&self) {
+        self.send.closed().await
+    }
+
     pub async fn safe_send(&mut self, seq: u64, item: T) -> Result<(), SequencedSenderError<T>> {
         self._send(Some(seq), item).await
     }
@@ -173,6 +177,10 @@ impl<T> SequencedReceiver<T> {
             next_seq,
             receiver
         }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
     }
 
     pub async fn recv(&mut self) -> Option<(u64, T)> {
@@ -475,7 +483,6 @@ impl<T: Send + Clone + 'static> Worker<T> {
                         };
 
                         if next.handler.send(sender).is_ok() {
-                            tracing::info!("worker rx replaced");
                             self.rx = rx;
                         }
                     }
@@ -580,8 +587,6 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                     /* sub is caught up */
                     if self.queue.len() == offset {
-                        tracing::info!("caught up {}", self.rx.is_closed());
-
                         /* no more data available, close sub */
                         if self.rx.is_closed() {
                             tracing::info!(
