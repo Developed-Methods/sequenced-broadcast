@@ -1,14 +1,8 @@
 use std::{
-    collections::VecDeque,
-    fmt::Debug,
-    future::{poll_fn, Future},
-    pin::Pin,
-    sync::{
+    collections::VecDeque, fmt::Debug, future::{poll_fn, Future}, sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
-    },
-    task::Poll,
-    time::{Duration, Instant},
+    }, task::Poll, time::{Duration, Instant}
 };
 
 use tokio::sync::{
@@ -19,15 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 pub struct SequencedBroadcast<T> {
-    new_subscriber: Sender<NewClient<T>>,
+    new_client_tx: Sender<NewClient<T>>,
     metrics: Arc<SequencedBroadcastMetrics>,
     shutdown: CancellationToken,
-    next_req: Sender<NextReq<T>>,
-}
-
-struct NextReq<T> {
-    start_seq: u64,
-    handler: oneshot::Sender<SequencedSender<T>>,
 }
 
 pub struct SequencedSender<T> {
@@ -72,8 +60,11 @@ pub struct SequencedBroadcastSettings {
 
 struct Worker<T> {
     rx: Receiver<(u64, T)>,
+    rx_closed: bool,
+    rx_full: bool,
+    next_rx: Option<(u64, T)>,
     next_sub_id: u64,
-    new_client: Receiver<NewClient<T>>,
+    new_client_rx: Receiver<NewClient<T>>,
     next_client: Option<NewClient<T>>,
     subscribers: Vec<Subscriber<T>>,
     queue: VecDeque<(u64, T)>,
@@ -81,8 +72,6 @@ struct Worker<T> {
     metrics: Arc<SequencedBroadcastMetrics>,
     settings: SequencedBroadcastSettings,
     shutdown: CancellationToken,
-    next_req_rx: Receiver<NextReq<T>>,
-    next_req: Option<NextReq<T>>,
 }
 
 impl Default for SequencedBroadcastSettings {
@@ -231,6 +220,17 @@ impl<T> SequencedSenderError<T> {
 
 impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
     pub fn new(next_seq: u64, settings: SequencedBroadcastSettings) -> (Self, SequencedSender<T>) {
+        let (tx, rx) = channel(1024);
+        let tx = SequencedSender::new(next_seq, tx);
+        let rx = SequencedReceiver::new(next_seq, rx);
+
+        (
+            Self::new2(rx, settings),
+            tx
+        )
+    }
+
+    pub fn new2(receiver: SequencedReceiver<T>, settings: SequencedBroadcastSettings) -> Self {
         let queue_cap = ((settings.lag_start_threshold as usize)
             .next_power_of_two()
             .max(1024)
@@ -239,60 +239,52 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
 
         assert!(settings.lag_end_threshold <= settings.lag_start_threshold);
 
-        let (tx, rx) = channel(1024);
         let (client_tx, client_rx) = channel(32);
 
         let metrics = Arc::new(SequencedBroadcastMetrics {
-            oldest_sequence: AtomicU64::new(next_seq),
-            next_sequence: AtomicU64::new(next_seq),
+            oldest_sequence: AtomicU64::new(receiver.next_seq),
+            next_sequence: AtomicU64::new(receiver.next_seq),
             ..Default::default()
         });
 
         let shutdown = CancellationToken::new();
         let current_span = tracing::Span::current();
 
-        let (next_req_tx, next_req_rx) = channel(1);
-
         tokio::spawn(
             Worker {
-                rx,
+                rx: receiver.receiver,
+                next_rx: None,
+                rx_full: false,
+                rx_closed: false,
                 next_sub_id: 1,
-                new_client: client_rx,
+                new_client_rx: client_rx,
                 next_client: None,
                 subscribers: Vec::with_capacity(32),
                 queue: VecDeque::with_capacity(queue_cap),
-                next_queue_seq: next_seq,
+                next_queue_seq: receiver.next_seq,
                 metrics: metrics.clone(),
                 settings,
                 shutdown: shutdown.clone(),
-                next_req_rx,
-                next_req: None,
             }
             .start()
             .instrument(current_span),
         );
 
-        let tx = SequencedSender { next_seq, send: tx };
-
-        (
-            SequencedBroadcast {
-                next_req: next_req_tx,
-                new_subscriber: client_tx,
-                metrics,
-                shutdown,
-            },
-            tx,
-        )
+        Self {
+            new_client_tx: client_tx,
+            metrics,
+            shutdown,
+        }
     }
 
     pub async fn add_client(
         &self,
         next_sequence: u64,
         allow_drop: bool,
-    ) -> Option<SequencedReceiver<T>> {
+    ) -> Result<SequencedReceiver<T>, NewClientError> {
         let (tx, rx) = oneshot::channel();
 
-        self.new_subscriber
+        self.new_client_tx
             .send(NewClient {
                 response: tx,
                 allow_drop,
@@ -301,21 +293,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
             .await
             .expect("Failed to queue new subscriber, worker crashed");
 
-        rx.await.ok()
-    }
-
-    pub async fn replace_sender(&self, start_seq: u64) -> Option<SequencedSender<T>> {
-        let (tx, rx) = oneshot::channel();
-
-        self.next_req
-            .send(NextReq {
-                start_seq,
-                handler: tx,
-            })
-            .await
-            .expect("Worker shutdown");
-
-        rx.await.ok()
+        rx.await.expect("worker closed")
     }
 
     pub fn metrics_ref(&self) -> &SequencedBroadcastMetrics {
@@ -332,9 +310,15 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
 }
 
 struct NewClient<T> {
-    response: oneshot::Sender<SequencedReceiver<T>>,
+    response: oneshot::Sender<Result<SequencedReceiver<T>, NewClientError>>,
     next_sequence: u64,
     allow_drop: bool,
+}
+
+#[derive(Debug)]
+pub enum NewClientError {
+    SequenceTooFarAhead { seq: u64, max: u64 },
+    SequenceTooFarBehind { seq: u64, min: u64 },
 }
 
 impl<T> Debug for NewClient<T> {
@@ -347,34 +331,17 @@ impl<T> Debug for NewClient<T> {
     }
 }
 
-struct PendingSubSend<'a, T, F: 'a> {
-    next: &'a mut Option<T>,
-    next_sequence: &'a mut u64,
-    reserve: F,
-}
-
 impl<T: Send + Clone + 'static> Worker<T> {
     async fn start(mut self) {
-        let mut blocked_senders_idx = Vec::with_capacity(128);
-
         loop {
             tokio::task::yield_now().await;
 
             if self.next_client.is_none() {
-                self.next_client = self.new_client.try_recv().ok();
+                self.next_client = self.new_client_rx.try_recv().ok();
             }
 
             if self.shutdown.is_cancelled() {
                 tracing::info!("Stopping worker due to shutdown");
-                break;
-            }
-
-            /* not possible to have more clients, kill worker */
-            if self.subscribers.is_empty()
-                && self.next_client.is_none()
-                && self.new_client.is_closed()
-            {
-                tracing::info!("Stopping worker, rx closed and no more subscribers");
                 break;
             }
 
@@ -388,32 +355,43 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     .unwrap_or(self.next_queue_seq);
 
                 if self.next_client.is_none() {
-                    self.next_client = self.new_client.try_recv().ok();
+                    self.next_client = self.new_client_rx.try_recv().ok();
                 }
 
                 while let Some(new) = self.next_client.take() {
+                    self.next_client = self.new_client_rx.try_recv().ok();
+
                     /* Sequence in valid range */
                     if new.next_sequence < min_allowed_seq
                         || self.next_queue_seq < new.next_sequence
                     {
+                        self.metrics
+                            .new_client_drop_count
+                            .fetch_add(1, Ordering::Relaxed);
+
                         if new.next_sequence < min_allowed_seq {
                             tracing::info!(
                                 "Subscriber rejected, seq({}) < min_allowed({})",
                                 new.next_sequence,
                                 min_allowed_seq
                             );
+
+                            let _ = new.response.send(Err(NewClientError::SequenceTooFarBehind {
+                                seq: new.next_sequence,
+                                min: min_allowed_seq
+                            }));
                         } else {
                             tracing::info!(
                                 "Subscriber rejected, max_seq({}) < seq({})",
                                 self.next_queue_seq,
                                 new.next_sequence
                             );
-                        }
 
-                        self.metrics
-                            .new_client_drop_count
-                            .fetch_add(1, Ordering::Relaxed);
-                        drop(new);
+                            let _ = new.response.send(Err(NewClientError::SequenceTooFarAhead {
+                                seq: new.next_sequence,
+                                max: self.next_queue_seq
+                            }));
+                        }
 
                         continue;
                     }
@@ -429,7 +407,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                         next_seq: new.next_sequence,
                     };
 
-                    if new.response.send(rx).is_ok() {
+                    if new.response.send(Ok(rx)).is_ok() {
                         let sub_id = self.next_sub_id;
                         self.next_sub_id += 1;
 
@@ -456,50 +434,46 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     }
 
                     max_per_loop -= 1;
-                    self.next_client = self.new_client.try_recv().ok();
                 }
             }
 
-            if self.next_req.is_none() {
-                self.next_req = self.next_req_rx.try_recv().ok();
-            }
-
             /* fill queue with available data from rx */
-            {
-                let mut remaining_msg_count = (self.queue.capacity() - self.queue.len()).min(1024);
+            'fill_rx: {
+                if self.next_rx.is_none() {
+                    self.next_rx = self.rx.try_recv().ok();
+                }
 
-                loop {
-                    /* see if we need to replace the receiver */
-                    if matches!(&self.next_req, Some(next) if next.start_seq <= self.next_queue_seq)
-                    {
-                        let next = self.next_req.take().unwrap();
-                        self.next_req = self.next_req_rx.try_recv().ok();
+                let mut remaining_msg_count = self.rx_space().min(1024);
+                if remaining_msg_count == 0 {
+                    if !self.rx_full {
+                        self.rx_full = true;
+                        assert_eq!(self.queue.len(), self.queue.capacity());
+                        tracing::info!("Reached queue capacity {}", self.queue.len());
+                    }
 
-                        let (tx, rx) = channel(self.rx.capacity());
+                    break 'fill_rx;
+                }
 
-                        let sender = SequencedSender {
-                            next_seq: self.next_queue_seq,
-                            send: tx,
-                        };
+                self.rx_full = false;
 
-                        if next.handler.send(sender).is_ok() {
-                            self.rx = rx;
+                while let Some((seq, item)) = self.next_rx.take() {
+                    self.next_rx = match self.rx.try_recv() {
+                        Ok(v) => Some(v),
+                        Err(TryRecvError::Disconnected) => {
+                            self.rx_closed = true;
+                            None
                         }
-                    }
-
-                    if remaining_msg_count == 0 {
-                        break;
-                    }
-
-                    let Ok((seq, item)) = self.rx.try_recv() else {
-                        break;
+                        Err(TryRecvError::Empty) => None,
                     };
-                    assert_eq!(seq, self.next_queue_seq, "sequence is invalid");
 
+                    assert_eq!(seq, self.next_queue_seq, "sequence is invalid");
                     self.queue.push_back((seq, item));
                     self.next_queue_seq += 1;
 
                     remaining_msg_count -= 1;
+                    if remaining_msg_count == 0 {
+                        break;
+                    }
                 }
             }
 
@@ -513,220 +487,167 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 .map(|v| v.0)
                 .unwrap_or(self.next_queue_seq);
 
-            let mut min_sub_sequence = self.next_queue_seq;
-            blocked_senders_idx.clear();
+            let max_seq = oldest_queue_sequence + self.queue.len() as u64;
+            let lag_start_seq = max_seq.max(self.settings.lag_start_threshold) - self.settings.lag_start_threshold;
+            let lag_end_seq = lag_start_seq.max(max_seq.max(self.settings.lag_end_threshold) - self.settings.lag_end_threshold);
+
+            let mut min_sub_sequence_calc = self.next_queue_seq;
+            let mut earliest_lag_start_at_calc: Option<Instant> = None;
 
             let mut i = 0;
             'next_sub: while i < self.subscribers.len() {
                 let sub = &mut self.subscribers[i];
 
-                'write_to_sub: {
-                    /* try to send pending */
-                    if let Some(next) = sub.pending.take() {
-                        if let Err(error) = sub.tx.try_send((sub.next_sequence, next)) {
-                            if matches!(error, TrySendError::Closed(_)) {
-                                tracing::info!("Subscriber({}): channel closed, dropping", sub.id);
-
-                                if sub.lag_started_at.is_some() {
-                                    self.metrics
-                                        .lagging_subs_gauge
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                }
-
-                                self.metrics
-                                    .disconnect_count
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.subscribers.swap_remove(i);
-                                continue 'next_sub;
-                            }
-
-                            sub.pending = Some(error.into_inner().1);
-                            break 'write_to_sub;
-                        }
-
-                        sub.next_sequence += 1;
+                /* make sure sub is still valid */
+                if (sub.allow_drop && sub.next_sequence < oldest_queue_sequence) || sub.tx.is_closed() {
+                    if sub.tx.is_closed() {
+                        tracing::info!("Subscriber({}): channel closed, dropping", sub.id);
+                    } else {
+                        tracing::warn!(
+                            "Subscriber({}): lag behind available data ({} < {}), dropping",
+                            sub.id,
+                            sub.next_sequence,
+                            oldest_queue_sequence
+                        );
                     }
 
-                    assert!(sub.pending.is_none());
-
-                    /* sub is too far behind or is closed */
-                    if sub.next_sequence < oldest_queue_sequence || sub.tx.is_closed() {
-                        if sub.next_sequence < oldest_queue_sequence {
-                            tracing::warn!(
-                                "Subscriber({}): lag behind available data ({} < {}), dropping",
-                                sub.id,
-                                sub.next_sequence,
-                                oldest_queue_sequence
-                            );
-                        } else {
-                            tracing::info!("Subscriber({}): channel closed, dropping", sub.id);
-                        }
-
-                        if sub.lag_started_at.is_some() {
-                            self.metrics
-                                .lagging_subs_gauge
-                                .fetch_sub(1, Ordering::Relaxed);
-                        }
-
+                    if sub.lag_started_at.is_some() {
                         self.metrics
-                            .disconnect_count
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.subscribers.swap_remove(i);
+                            .lagging_subs_gauge
+                            .fetch_sub(1, Ordering::Relaxed);
+                    }
+
+                    self.metrics
+                        .disconnect_count
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    self.subscribers.swap_remove(i);
+                    continue 'next_sub;
+                }
+
+                /* write_to_sub */
+                let mut offset = {
+                    assert!(sub.next_sequence >= oldest_queue_sequence);
+                    let offset = (sub.next_sequence - oldest_queue_sequence) as usize;
+                    assert!(sub.next_sequence <= self.next_queue_seq, "sub cannot be ahead of queue sequence");
+                    assert!(offset <= self.queue.len(), "sub cannot be ahead of queue sequence");
+                    offset
+                };
+
+                /* prep next message to send */
+                if sub.pending.is_none() {
+                    /* fully caught up */
+                    if self.queue.len() == offset {
+                        i += 1;
                         continue 'next_sub;
                     }
 
-                    let mut offset = (sub.next_sequence - oldest_queue_sequence) as usize;
-                    assert!(
-                        sub.next_sequence <= self.next_queue_seq,
-                        "sub cannot be ahead of queue sequence"
-                    );
-                    assert!(
-                        offset <= self.queue.len(),
-                        "sub cannot be ahead of queue sequence"
-                    );
+                    /* make next item pending */
+                    let (seq, item) = self.queue.get(offset).unwrap();
+                    assert_eq!(*seq, sub.next_sequence);
+                    sub.pending = Some(item.clone());
+                }
 
-                    /* sub is caught up */
-                    if self.queue.len() == offset {
-                        /* no more data available, close sub */
-                        if self.rx.is_closed() {
-                            tracing::info!(
-                                "Subscriber({}): read all available data, dropping",
-                                sub.id
-                            );
+                /* send as much as possible */
+                while let Some(next) = sub.pending.take() {
+                    match sub.tx.try_send((sub.next_sequence, next)) {
+                        Ok(_) => {
+                            sub.next_sequence += 1;
+                            offset += 1;
 
-                            if sub.lag_started_at.is_some() {
-                                self.metrics
-                                    .lagging_subs_gauge
-                                    .fetch_sub(1, Ordering::Relaxed);
+                            if self.queue.len() == offset {
+                                break;
                             }
 
-                            self.metrics
-                                .disconnect_count
-                                .fetch_add(1, Ordering::Relaxed);
-                            self.subscribers.swap_remove(i);
-                            continue 'next_sub;
+                            let (seq, item) = self.queue.get(offset).unwrap();
+                            assert_eq!(*seq, sub.next_sequence);
+                            sub.pending = Some(item.clone());
                         }
-
-                        break 'write_to_sub;
-                    }
-
-                    while offset < self.queue.len() {
-                        let (seq, item) = self.queue.get(offset).unwrap();
-                        assert_eq!(*seq, sub.next_sequence);
-
-                        if let Err(error) = sub.tx.try_send((*seq, item.clone())) {
-                            if matches!(error, TrySendError::Closed(_)) {
-                                tracing::info!("Subscriber({}): channel closed, dropping", sub.id);
-
-                                if sub.lag_started_at.is_some() {
-                                    self.metrics
-                                        .lagging_subs_gauge
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                }
-                                self.metrics
-                                    .disconnect_count
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.subscribers.swap_remove(i);
-                                continue 'next_sub;
-                            }
-
-                            sub.pending = Some(error.into_inner().1);
-                            break 'write_to_sub;
+                        Err(TrySendError::Closed(_)) => break,
+                        Err(TrySendError::Full((_seq, item))) => {
+                            sub.pending = Some(item);
+                            break;
                         }
-
-                        sub.next_sequence += 1;
-                        offset += 1;
                     }
-                };
+                }
 
-                'lag_drop: {
-                    let lag = self.next_queue_seq - sub.next_sequence;
-
-                    if lag <= self.settings.lag_end_threshold {
+                if sub.allow_drop {
+                    if lag_end_seq <= sub.next_sequence {
                         if let Some(lag_start) = sub.lag_started_at.take() {
                             tracing::info!(
                                 "Subscriber({}): caught up after {:?}",
                                 sub.id,
                                 lag_start.elapsed()
                             );
+
                             self.metrics
                                 .lagging_subs_gauge
                                 .fetch_sub(1, Ordering::Relaxed);
                         }
-                        break 'lag_drop;
                     }
+                    else if sub.next_sequence < lag_start_seq {
+                        if let Some(lag_start) = &sub.lag_started_at {
+                            let lag_duration = lag_start.elapsed();
 
-                    /* note: allows subscriber to stay longer than max delay if under start threshold */
+                            if self.settings.max_time_lag < lag_duration {
+                                tracing::info!(
+                                    "Subscriber({}): lag too high for too long ({:?}), dropping",
+                                    sub.id,
+                                    lag_duration,
+                                );
 
-                    if lag < self.settings.lag_start_threshold {
-                        break 'lag_drop;
+                                self.metrics
+                                    .lagging_subs_gauge
+                                    .fetch_sub(1, Ordering::Relaxed);
+
+                                self.metrics
+                                    .disconnect_count
+                                    .fetch_add(1, Ordering::Relaxed);
+
+                                self.subscribers.swap_remove(i);
+                                continue 'next_sub;
+                            }
+                        } else {
+                            sub.lag_started_at = Some(Instant::now());
+
+                            tracing::info!(
+                                "Subscriber({}): lag started thresh({}) < lag({})",
+                                sub.id,
+                                self.settings.lag_start_threshold,
+                                max_seq - sub.next_sequence,
+                            );
+
+                            self.metrics
+                                .lagging_subs_gauge
+                                .fetch_add(1, Ordering::Relaxed);
+                            }
                     }
+                }
 
-                    let lag_duration = if let Some(lag_start) = &sub.lag_started_at {
-                        if !sub.allow_drop {
-                            break 'lag_drop;
-                        }
-
-                        let duration = lag_start.elapsed();
-                        if duration < self.settings.max_time_lag {
-                            break 'lag_drop;
-                        }
-
-                        duration
-                    } else {
-                        tracing::info!(
-                            "Subscriber({}): lag started thresh({}) <= lag({})",
-                            sub.id,
-                            self.settings.lag_start_threshold,
-                            lag,
-                        );
-
-                        self.metrics
-                            .lagging_subs_gauge
-                            .fetch_add(1, Ordering::Relaxed);
-                        sub.lag_started_at = Some(Instant::now());
-                        break 'lag_drop;
+                if let Some(lag_started_at) = &sub.lag_started_at {
+                    earliest_lag_start_at_calc = match earliest_lag_start_at_calc {
+                        Some(v) if v.lt(lag_started_at) => Some(v),
+                        _ => sub.lag_started_at
                     };
-
-                    /* drop connection due to high lag */
-
-                    tracing::info!(
-                        "Subscriber({}): lag too high for too long ({:?}), dropping",
-                        sub.id,
-                        lag_duration,
-                    );
-
-                    assert!(sub.allow_drop);
-                    self.metrics
-                        .lagging_subs_gauge
-                        .fetch_sub(1, Ordering::Relaxed);
-                    self.metrics
-                        .disconnect_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.subscribers.swap_remove(i);
-                    continue 'next_sub;
                 }
 
-                if sub.pending.is_some() {
-                    blocked_senders_idx.push(i);
-                }
-
-                min_sub_sequence = min_sub_sequence.min(sub.next_sequence);
+                min_sub_sequence_calc = min_sub_sequence_calc.min(sub.next_sequence);
                 i += 1;
             }
+
+            let min_sub_sequence = min_sub_sequence_calc;
 
             self.metrics
                 .active_subs_gauge
                 .store(self.subscribers.len() as u64, Ordering::Relaxed);
+
             self.metrics
                 .min_sub_sequence_gauge
                 .store(min_sub_sequence, Ordering::Relaxed);
 
-            /* trim queue */
+            /* trim rx queue */
             {
-                let mut keep_seq =
-                    self.next_queue_seq.max(self.settings.min_history) - self.settings.min_history;
-                keep_seq = keep_seq.min(min_sub_sequence);
+                let keep_seq = min_sub_sequence.min(max_seq.max(self.settings.min_history) - self.settings.min_history);
 
                 if oldest_queue_sequence < keep_seq {
                     let remove_count = keep_seq - oldest_queue_sequence;
@@ -740,104 +661,170 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 }
             }
 
-            let mut sending_sub_sends = Vec::with_capacity(blocked_senders_idx.len());
+            if self.rx_closed && min_sub_sequence == max_seq {
+                tracing::info!("RX closed and all subscribers caught up, closing");
+                return;
+            }
+
+            let rx_blocked = self.next_rx.is_none() && !self.rx_closed;
+            let next_timeout = earliest_lag_start_at_calc.map(|early| {
+                let now = Instant::now();
+                let expire = early + self.settings.max_time_lag;
+                (expire.max(now) - now).max(Duration::from_millis(100))
+            });
+
+            /* see if there's more work available without waiting */
             {
-                let mut taken = 0;
-                let mut remaining = &mut self.subscribers[..];
+                /* update RX */
+                if !rx_blocked && 0 < self.rx_space() {
+                    tracing::trace!("have more rx");
+                    continue;
+                }
 
-                for index in &blocked_senders_idx {
-                    /* note: messy to make compiler work without unsafe */
-                    let sub = {
-                        let (old, next) = remaining.split_at_mut(*index - taken + 1);
-                        taken += old.len();
-                        remaining = next;
-                        old.last_mut().unwrap()
-                    };
-
-                    let Subscriber {
-                        pending: next,
-                        next_sequence,
-                        tx,
-                        ..
-                    } = sub;
-
-                    sending_sub_sends.push(PendingSubSend {
-                        next,
-                        next_sequence,
-                        reserve: tx.reserve(),
-                    });
+                /* new client available */
+                if self.next_client.is_some() {
+                    tracing::trace!("have next client");
+                    continue;
                 }
             }
 
-            let can_receive_more = !self.rx.is_closed() && self.queue.len() < self.queue.capacity();
-            let new_client_closed = self.new_client.is_closed();
-            let next_req_closed = self.next_req_rx.is_closed();
+            let mut timeout_fut = next_timeout.map(|duration| tokio::time::sleep(duration));
+            let mut pending_tx = Vec::new();
+            let new_client_rx = &mut self.new_client_rx;
+            let new_msg_rx = &mut self.rx;
+            let next_rx = &mut self.next_rx;
+            let next_client = &mut self.next_client;
 
-            let mut timeout =
-                tokio::time::sleep(self.settings.max_time_lag.max(Duration::from_millis(100)));
-            let mut canceled = self.shutdown.cancelled();
+            for sub in &mut self.subscribers {
+                if sub.pending.is_some() {
+                    pending_tx.push((sub.tx.reserve(), &mut sub.pending, &mut sub.next_sequence));
+                }
+            }
 
             poll_fn(|cx| {
-                let canceled = unsafe { Pin::new_unchecked(&mut canceled) };
-                if let Poll::Ready(()) = canceled.poll(cx) {
+                if let Some(timeout) = &mut timeout_fut {
+                    if unsafe { std::pin::Pin::new_unchecked(timeout) }.poll(cx).is_ready() {
+                        tracing::trace!("poll: max lag timer reached");
+                        return Poll::Ready(());
+                    }
+                }
+
+                if rx_blocked {
+                    if let Poll::Ready(item) = unsafe { std::pin::Pin::new_unchecked(&mut *new_msg_rx) }.poll_recv(cx) {
+                        assert!(next_rx.is_none());
+
+                        *next_rx = item;
+                        if next_rx.is_some() {
+                            tracing::trace!("poll: new RX available");
+                        } else {
+                            tracing::trace!("poll: RX closed");
+                        }
+
+                        return Poll::Ready(());
+                    }
+                }
+
+                if let Poll::Ready(item) = unsafe { std::pin::Pin::new_unchecked(&mut *new_client_rx) }.poll_recv(cx) {
+                    tracing::trace!("poll: new client");
+
+                    assert!(next_client.is_none());
+                    *next_client = item;
                     return Poll::Ready(());
                 }
 
-                let mut has_ready = false;
+                let mut sent = false;
+                for (reserve, pending, next_sequence) in &mut pending_tx {
+                    let reserve = unsafe { std::pin::Pin::new_unchecked(reserve) };
 
-                for pending in &mut sending_sub_sends {
-                    let reserve = unsafe { Pin::new_unchecked(&mut pending.reserve) };
-
-                    if let Poll::Ready(result) = reserve.poll(cx) {
-                        has_ready = true;
-
-                        if let Ok(reserved) = result {
-                            if let Some(next) = pending.next.take() {
-                                reserved.send((*pending.next_sequence, next));
-                                *pending.next_sequence += 1;
-                            }
+                    match reserve.poll(cx) {
+                        Poll::Ready(Ok(slot)) => {
+                            let item = pending.take().expect("pending missing");
+                            let seq = **next_sequence;
+                            slot.send((seq, item));
+                            **next_sequence = seq + 1;
+                            
+                            sent = true;
                         }
-                    }
-                }
-
-                if !new_client_closed {
-                    if let Poll::Ready(item) = self.new_client.poll_recv(cx) {
-                        has_ready = true;
-                        self.next_client = item;
-                    }
-                }
-
-                if can_receive_more {
-                    if let Poll::Ready(item) = self.rx.poll_recv(cx) {
-                        has_ready = true;
-
-                        if let Some((seq, msg)) = item {
-                            assert_eq!(seq, self.next_queue_seq);
-                            self.queue.push_back((seq, msg));
-                            self.next_queue_seq += 1;
+                        Poll::Ready(Err(_)) => {
+                            sent = true;
                         }
+                        Poll::Pending => {}
                     }
                 }
 
-                if !next_req_closed {
-                    if let Poll::Ready(item) = self.next_req_rx.poll_recv(cx) {
-                        has_ready = true;
-                        self.next_req = item;
-                    }
+                if sent {
+                    tracing::trace!("poll: subscriber message sent");
+                    return Poll::Ready(());
                 }
 
-                if !has_ready {
-                    has_ready = unsafe { Pin::new_unchecked(&mut timeout) }.poll(cx).is_ready();
-                }
+                Poll::Pending
+            }).await;
 
-                if has_ready {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
+
+            // let can_receive_more = !self.rx.is_closed() && self.queue.len() < self.queue.capacity();
+            // let new_client_closed = self.new_client_rx.is_closed();
+            // let mut timeout =
+            //     tokio::time::sleep(self.settings.max_time_lag.max(Duration::from_millis(100)));
+            // let mut canceled = self.shutdown.cancelled();
+
+            // poll_fn(|cx| {
+            //     let canceled = unsafe { Pin::new_unchecked(&mut canceled) };
+            //     if let Poll::Ready(()) = canceled.poll(cx) {
+            //         return Poll::Ready(());
+            //     }
+
+            //     let mut has_ready = false;
+
+            //     for pending in &mut sending_sub_sends {
+            //         let reserve = unsafe { Pin::new_unchecked(&mut pending.reserve) };
+
+            //         if let Poll::Ready(result) = reserve.poll(cx) {
+            //             has_ready = true;
+
+            //             if let Ok(reserved) = result {
+            //                 if let Some(next) = pending.next.take() {
+            //                     reserved.send((*pending.next_sequence, next));
+            //                     *pending.next_sequence += 1;
+            //                 }
+            //             }
+            //         }
+            //     }
+
+            //     if !new_client_closed {
+            //         if let Poll::Ready(item) = self.new_client_rx.poll_recv(cx) {
+            //             has_ready = true;
+            //             self.next_client = item;
+            //         }
+            //     }
+
+            //     if can_receive_more {
+            //         if let Poll::Ready(item) = self.rx.poll_recv(cx) {
+            //             has_ready = true;
+
+            //             if let Some((seq, msg)) = item {
+            //                 assert_eq!(seq, self.next_queue_seq);
+            //                 self.queue.push_back((seq, msg));
+            //                 self.next_queue_seq += 1;
+            //             }
+            //         }
+            //     }
+
+            //     if !has_ready {
+            //         has_ready = unsafe { Pin::new_unchecked(&mut timeout) }.poll(cx).is_ready();
+            //     }
+
+            //     if has_ready {
+            //         Poll::Ready(())
+            //     } else {
+            //         Poll::Pending
+            //     }
+            // })
+            // .await;
         }
+    }
+
+    fn rx_space(&self) -> usize {
+        self.queue.capacity() - self.queue.len()
     }
 }
 
@@ -847,44 +834,7 @@ mod test {
 
     pub fn setup_logging() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    }
-
-    #[tokio::test]
-    async fn subscribers_replace_sender_test() {
-        setup_logging();
-
-        let (subs, mut tx1) =
-            SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
-        tx1.safe_send(0, "Hello WOrld").await.unwrap();
-        tx1.safe_send(1, "What the heck").await.unwrap();
-
-        let mut tx2 = tokio::time::timeout(Duration::from_millis(10), subs.replace_sender(2))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(
-            tx1.send("fail").await,
-            Err(SequencedSenderError::ChannelClosed("fail"))
-        );
-
-        tx2.safe_send(2, "Hehe").await.unwrap();
-
-        let mut sub_1 = subs.add_client(0, true).await.unwrap();
-        assert_eq!((0, "Hello WOrld"), sub_1.recv().await.unwrap());
-        assert_eq!((1, "What the heck"), sub_1.recv().await.unwrap());
-        assert_eq!((2, "Hehe"), sub_1.recv().await.unwrap());
-
-        let mut tx3 = tokio::time::timeout(Duration::from_millis(10), subs.replace_sender(2))
-            .await
-            .unwrap()
-            .unwrap();
-        drop(tx1);
-        drop(tx2);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        tx3.safe_send(3, "It works").await.unwrap();
-        assert_eq!((3, "It works"), sub_1.recv().await.unwrap());
+        // let _ = tracing_subscriber::fmt().try_init();
     }
 
     #[tokio::test]
@@ -893,6 +843,7 @@ mod test {
 
         let (subs, mut tx) =
             SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+
         tx.send("Hello WOrld").await.unwrap();
         tx.send("What the heck").await.unwrap();
 
@@ -914,6 +865,40 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sequenced_broadcast_simple_test() {
+        setup_logging();
+
+        let (subs, mut tx) =
+            SequencedBroadcast::<u64>::new(10, SequencedBroadcastSettings::default());
+
+        let mut client = subs.add_client(10, true).await.unwrap();
+        tracing::info!("client added");
+
+        let read_task = tokio::spawn(async move {
+            let mut i = 0;
+            let mut seq = 10;
+
+            while let Some(msg) = client.recv().await {
+                assert_eq!(msg, (seq, i));
+                i += 1;
+                seq += 1;
+            }
+
+            i
+        });
+
+        let count = 1024 * 16;
+
+        for i in 0..count {
+            tx.send(i).await.unwrap();
+        }
+        drop(tx);
+
+        let total = read_task.await.unwrap();
+        assert_eq!(total, count);
+    }
+
+    #[tokio::test]
     async fn subscribers_test() {
         setup_logging();
 
@@ -926,11 +911,11 @@ mod test {
         assert_eq!((10, "Hello WOrld"), sub.recv().await.unwrap());
         assert_eq!((11, "What the heck"), sub.recv().await.unwrap());
 
-        assert!(subs.add_client(10, true).await.is_some());
-        assert!(subs.add_client(11, true).await.is_some());
-        assert!(subs.add_client(12, true).await.is_some());
-        assert!(subs.add_client(13, true).await.is_none());
-        assert!(subs.add_client(9, true).await.is_none());
+        assert!(subs.add_client(10, true).await.is_ok());
+        assert!(subs.add_client(11, true).await.is_ok());
+        assert!(subs.add_client(12, true).await.is_ok());
+        assert!(subs.add_client(13, true).await.is_err());
+        assert!(subs.add_client(9, true).await.is_err());
 
         tx.send("Butts").await.unwrap();
         assert_eq!((12, "Butts"), sub.recv().await.unwrap());
@@ -954,14 +939,18 @@ mod test {
 
         let mut sub = subs.add_client(1, false).await.unwrap();
 
-        loop {
-            if tokio::time::timeout(Duration::from_secs(1), tx.send(1))
-                .await
-                .is_err()
-            {
-                break;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::time::timeout(Duration::from_secs(1), tx.send(1))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
+        }).await.expect("client must have been dropped as can still send tx");
+
+        tracing::info!("tx filled");
 
         assert!(tokio::time::timeout(Duration::from_secs(1), tx.send(1))
             .await
