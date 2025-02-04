@@ -40,6 +40,19 @@ pub struct SequencedBroadcastMetrics {
     pub disconnect_count: AtomicU64,
 }
 
+impl SequencedBroadcastMetrics {
+    pub fn update(&self, other: &Self) {
+        self.oldest_sequence.store(other.oldest_sequence.load(Ordering::Acquire), Ordering::Release);
+        self.next_sequence.store(other.next_sequence.load(Ordering::Acquire), Ordering::Release);
+        self.new_client_drop_count.store(other.new_client_drop_count.load(Ordering::Acquire), Ordering::Release);
+        self.new_client_accept_count.store(other.new_client_accept_count.load(Ordering::Acquire), Ordering::Release);
+        self.lagging_subs_gauge.store(other.lagging_subs_gauge.load(Ordering::Acquire), Ordering::Release);
+        self.active_subs_gauge.store(other.active_subs_gauge.load(Ordering::Acquire), Ordering::Release);
+        self.min_sub_sequence_gauge.store(other.min_sub_sequence_gauge.load(Ordering::Acquire), Ordering::Release);
+        self.disconnect_count.store(other.disconnect_count.load(Ordering::Acquire), Ordering::Release);
+    }
+}
+
 struct Subscriber<T> {
     id: u64,
     next_sequence: u64,
@@ -759,67 +772,6 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                 Poll::Pending
             }).await;
-
-
-            // let can_receive_more = !self.rx.is_closed() && self.queue.len() < self.queue.capacity();
-            // let new_client_closed = self.new_client_rx.is_closed();
-            // let mut timeout =
-            //     tokio::time::sleep(self.settings.max_time_lag.max(Duration::from_millis(100)));
-            // let mut canceled = self.shutdown.cancelled();
-
-            // poll_fn(|cx| {
-            //     let canceled = unsafe { Pin::new_unchecked(&mut canceled) };
-            //     if let Poll::Ready(()) = canceled.poll(cx) {
-            //         return Poll::Ready(());
-            //     }
-
-            //     let mut has_ready = false;
-
-            //     for pending in &mut sending_sub_sends {
-            //         let reserve = unsafe { Pin::new_unchecked(&mut pending.reserve) };
-
-            //         if let Poll::Ready(result) = reserve.poll(cx) {
-            //             has_ready = true;
-
-            //             if let Ok(reserved) = result {
-            //                 if let Some(next) = pending.next.take() {
-            //                     reserved.send((*pending.next_sequence, next));
-            //                     *pending.next_sequence += 1;
-            //                 }
-            //             }
-            //         }
-            //     }
-
-            //     if !new_client_closed {
-            //         if let Poll::Ready(item) = self.new_client_rx.poll_recv(cx) {
-            //             has_ready = true;
-            //             self.next_client = item;
-            //         }
-            //     }
-
-            //     if can_receive_more {
-            //         if let Poll::Ready(item) = self.rx.poll_recv(cx) {
-            //             has_ready = true;
-
-            //             if let Some((seq, msg)) = item {
-            //                 assert_eq!(seq, self.next_queue_seq);
-            //                 self.queue.push_back((seq, msg));
-            //                 self.next_queue_seq += 1;
-            //             }
-            //         }
-            //     }
-
-            //     if !has_ready {
-            //         has_ready = unsafe { Pin::new_unchecked(&mut timeout) }.poll(cx).is_ready();
-            //     }
-
-            //     if has_ready {
-            //         Poll::Ready(())
-            //     } else {
-            //         Poll::Pending
-            //     }
-            // })
-            // .await;
         }
     }
 
