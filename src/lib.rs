@@ -17,6 +17,7 @@ pub struct SequencedBroadcast<T> {
     metrics: Arc<SequencedBroadcastMetrics>,
     shutdown: CancellationToken,
     worker_loops: Arc<AtomicU64>,
+    closed: oneshot::Receiver<()>,
 }
 
 pub struct SequencedSender<T> {
@@ -76,12 +77,15 @@ pub struct SequencedBroadcastSettings {
 
 struct Worker<T> {
     rx: Receiver<(u64, T)>,
+    next_rx: Option<(u64, T)>,
     rx_closed: bool,
     rx_full: bool,
-    next_rx: Option<(u64, T)>,
-    next_sub_id: u64,
-    new_client_rx: Receiver<NewClient<T>>,
+
+    next_client_rx: Receiver<NewClient<T>>,
     next_client: Option<NewClient<T>>,
+    next_client_closed: bool,
+
+    next_sub_id: u64,
     subscribers: Vec<Subscriber<T>>,
     queue: VecDeque<(u64, T)>,
     next_queue_seq: u64,
@@ -89,6 +93,7 @@ struct Worker<T> {
     settings: SequencedBroadcastSettings,
     shutdown: CancellationToken,
     worker_loops: Arc<AtomicU64>,
+    closed: oneshot::Sender<()>,
 }
 
 impl Default for SequencedBroadcastSettings {
@@ -266,6 +271,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
 
         let shutdown = CancellationToken::new();
         let current_span = tracing::Span::current();
+        let (closed_tx, closed_rx) = oneshot::channel();
 
         let worker_loops = Arc::new(AtomicU64::new(0));
 
@@ -275,9 +281,12 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
                 next_rx: None,
                 rx_full: false,
                 rx_closed: false,
-                next_sub_id: 1,
-                new_client_rx: client_rx,
+
+                next_client_rx: client_rx,
                 next_client: None,
+                next_client_closed: false,
+
+                next_sub_id: 1,
                 subscribers: Vec::with_capacity(32),
                 queue: VecDeque::with_capacity(queue_cap),
                 next_queue_seq: receiver.next_seq,
@@ -285,6 +294,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
                 settings,
                 shutdown: shutdown.clone(),
                 worker_loops: worker_loops.clone(),
+                closed: closed_tx,
             }
             .start()
             .instrument(current_span),
@@ -295,6 +305,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
             metrics,
             shutdown,
             worker_loops,
+            closed: closed_rx,
         }
     }
 
@@ -329,8 +340,17 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
         self.worker_loops.load(Ordering::Relaxed)
     }
 
-    pub fn shutdown(self) {
+    pub fn shutdown(self) -> oneshot::Receiver<()> {
         self.shutdown.cancel();
+        self.closed
+    }
+
+    pub async fn shutdown_wait(self) {
+        self.shutdown().await.unwrap();
+    }
+
+    pub fn closed(self) -> oneshot::Receiver<()> {
+        self.closed
     }
 }
 
@@ -359,32 +379,43 @@ impl<T> Debug for NewClient<T> {
 static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(1)));
 
 impl<T: Send + Clone + 'static> Worker<T> {
-    async fn start(self) {
+    async fn start(mut self) {
         let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
-        tracing::info!(id, "SequencedBroadcastWorker Started");
+        tracing::info!(id, "{}|SequencedBroadcastWorker Started", id);
         let start = Instant::now();
 
-        self._start().await;
+        self._start(id).await;
         let elapsed = start.elapsed();
-        tracing::info!(id, ?elapsed, "SequencedBroadcastWorker Stopped");
+        let iter = self.worker_loops.load(Ordering::Relaxed);
+
+        tracing::info!(id, ?elapsed, iter, "{}|SequencedBroadcastWorker Stopped", id);
+
+        let _ = self.closed.send(());
     }
 
-    async fn _start(mut self) {
+    async fn _start(&mut self, id: u64) {
         loop {
             self.worker_loops.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
 
             if self.next_client.is_none() {
-                self.next_client = self.new_client_rx.try_recv().ok();
+                self.next_client = match self.next_client_rx.try_recv() {
+                    Ok(item) => Some(item),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        self.next_client_closed = true;
+                        None
+                    }
+                };
             }
 
             if self.shutdown.is_cancelled() {
-                tracing::info!("Stopping worker due to shutdown");
+                tracing::info!("{}|Stopping worker due to shutdown", id);
                 break;
             }
 
             /* accept new clients */
-            {
+            if !self.next_client_closed {
                 let mut max_per_loop = 32;
                 let min_allowed_seq = self
                     .queue
@@ -392,12 +423,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     .map(|i| i.0)
                     .unwrap_or(self.next_queue_seq);
 
-                if self.next_client.is_none() {
-                    self.next_client = self.new_client_rx.try_recv().ok();
-                }
-
                 while let Some(new) = self.next_client.take() {
-                    self.next_client = self.new_client_rx.try_recv().ok();
+                    self.next_client = self.next_client_rx.try_recv().ok();
 
                     /* Sequence in valid range */
                     if new.next_sequence < min_allowed_seq
@@ -409,7 +436,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                         if new.next_sequence < min_allowed_seq {
                             tracing::info!(
-                                "Subscriber rejected, seq({}) < min_allowed({})",
+                                "{}|Subscriber rejected, seq({}) < min_allowed({})",
+                                id,
                                 new.next_sequence,
                                 min_allowed_seq
                             );
@@ -420,7 +448,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                             }));
                         } else {
                             tracing::info!(
-                                "Subscriber rejected, max_seq({}) < seq({})",
+                                "{}|Subscriber rejected, max_seq({}) < seq({})",
+                                id,
                                 self.next_queue_seq,
                                 new.next_sequence
                             );
@@ -450,8 +479,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                         self.next_sub_id += 1;
 
                         tracing::info!(
-                            "Subscriber({}): Added, allow_drop: {}, next_sequence: {}, min_allowed_seq: {}",
-                            sub_id, new.allow_drop, new.next_sequence, min_allowed_seq,
+                            "{}|Subscriber({}): Added, allow_drop: {}, next_sequence: {}, min_allowed_seq: {}",
+                            id, sub_id, new.allow_drop, new.next_sequence, min_allowed_seq,
                         );
 
                         self.subscribers.push(Subscriber {
@@ -463,7 +492,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                             lag_started_at: None,
                         });
                     } else {
-                        tracing::warn!("New subscriber accepted but receiver dropped");
+                        tracing::warn!("{}|New subscriber accepted but receiver dropped", id);
                     }
 
                     /* ensure we don't block getting new clients */
@@ -478,7 +507,14 @@ impl<T: Send + Clone + 'static> Worker<T> {
             /* fill queue with available data from rx */
             'fill_rx: {
                 if self.next_rx.is_none() {
-                    self.next_rx = self.rx.try_recv().ok();
+                    self.next_rx = match self.rx.try_recv() {
+                        Ok(msg) => Some(msg),
+                        Err(TryRecvError::Disconnected) => {
+                            self.rx_closed = true;
+                            None
+                        }
+                        Err(TryRecvError::Empty) => None,
+                    };
                 }
 
                 let mut remaining_msg_count = self.rx_space().min(1024);
@@ -486,7 +522,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     if !self.rx_full {
                         self.rx_full = true;
                         assert_eq!(self.queue.len(), self.queue.capacity());
-                        tracing::info!("Reached queue capacity {}", self.queue.len());
+                        tracing::info!("{}|Reached queue capacity {}", id, self.queue.len());
                     }
 
                     break 'fill_rx;
@@ -495,14 +531,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 self.rx_full = false;
 
                 while let Some((seq, item)) = self.next_rx.take() {
-                    self.next_rx = match self.rx.try_recv() {
-                        Ok(v) => Some(v),
-                        Err(TryRecvError::Disconnected) => {
-                            self.rx_closed = true;
-                            None
-                        }
-                        Err(TryRecvError::Empty) => None,
-                    };
+                    self.next_rx = self.rx.try_recv().ok();
 
                     assert_eq!(seq, self.next_queue_seq, "sequence is invalid");
                     self.queue.push_back((seq, item));
@@ -539,10 +568,11 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 /* make sure sub is still valid */
                 if (sub.allow_drop && sub.next_sequence < oldest_queue_sequence) || sub.tx.is_closed() {
                     if sub.tx.is_closed() {
-                        tracing::info!("Subscriber({}): channel closed, dropping", sub.id);
+                        tracing::info!("{}|Subscriber({}): channel closed, dropping", sub.id, id);
                     } else {
                         tracing::warn!(
-                            "Subscriber({}): lag behind available data ({} < {}), dropping",
+                            "{}|Subscriber({}): lag behind available data ({} < {}), dropping",
+                            id,
                             sub.id,
                             sub.next_sequence,
                             oldest_queue_sequence
@@ -613,7 +643,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     if lag_end_seq <= sub.next_sequence {
                         if let Some(lag_start) = sub.lag_started_at.take() {
                             tracing::info!(
-                                "Subscriber({}): caught up after {:?}",
+                                "{}|Subscriber({}): caught up after {:?}",
+                                id,
                                 sub.id,
                                 lag_start.elapsed()
                             );
@@ -629,7 +660,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                             if self.settings.max_time_lag < lag_duration {
                                 tracing::info!(
-                                    "Subscriber({}): lag too high for too long ({:?}), dropping",
+                                    "{}|Subscriber({}): lag too high for too long ({:?}), dropping",
+                                    id,
                                     sub.id,
                                     lag_duration,
                                 );
@@ -649,7 +681,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                             sub.lag_started_at = Some(Instant::now());
 
                             tracing::info!(
-                                "Subscriber({}): lag started thresh({}) < lag({})",
+                                "{}|Subscriber({}): lag started thresh({}) < lag({})",
+                                id,
                                 sub.id,
                                 self.settings.lag_start_threshold,
                                 max_seq - sub.next_sequence,
@@ -700,7 +733,12 @@ impl<T: Send + Clone + 'static> Worker<T> {
             }
 
             if self.rx_closed && min_sub_sequence == max_seq {
-                tracing::info!("RX closed and all subscribers caught up, closing");
+                tracing::info!("{}|RX closed and all subscribers caught up, shutting down worker", id);
+                return;
+            }
+
+            if self.next_client_closed && self.subscribers.is_empty() {
+                tracing::info!("{}|no subscribers and next_client_rx closed, shutting down worker", id);
                 return;
             }
 
@@ -715,20 +753,20 @@ impl<T: Send + Clone + 'static> Worker<T> {
             {
                 /* update RX */
                 if !rx_blocked && 0 < self.rx_space() {
-                    tracing::trace!("have more rx");
+                    tracing::trace!("{}|have more rx", id);
                     continue;
                 }
 
                 /* new client available */
                 if self.next_client.is_some() {
-                    tracing::trace!("have next client");
+                    tracing::trace!("{}|have next client", id);
                     continue;
                 }
             }
 
             let mut timeout_fut = next_timeout.map(|duration| tokio::time::sleep(duration));
             let mut pending_tx = Vec::new();
-            let new_client_rx = &mut self.new_client_rx;
+            let new_client_rx = &mut self.next_client_rx;
             let new_msg_rx = &mut self.rx;
             let next_rx = &mut self.next_rx;
             let next_client = &mut self.next_client;
@@ -742,7 +780,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
             poll_fn(|cx| {
                 if let Some(timeout) = &mut timeout_fut {
                     if unsafe { std::pin::Pin::new_unchecked(timeout) }.poll(cx).is_ready() {
-                        tracing::trace!("poll: max lag timer reached");
+                        tracing::trace!("{}|poll: max lag timer reached", id);
                         return Poll::Ready(());
                     }
                 }
@@ -753,9 +791,9 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
                         *next_rx = item;
                         if next_rx.is_some() {
-                            tracing::trace!("poll: new RX available");
+                            tracing::trace!("{}|poll: new RX available", id);
                         } else {
-                            tracing::trace!("poll: RX closed");
+                            tracing::trace!("{}|poll: RX closed", id);
                         }
 
                         return Poll::Ready(());
@@ -763,7 +801,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 }
 
                 if let Poll::Ready(item) = unsafe { std::pin::Pin::new_unchecked(&mut *new_client_rx) }.poll_recv(cx) {
-                    tracing::trace!("poll: new client");
+                    tracing::trace!("{}|poll: new client", id);
 
                     assert!(next_client.is_none());
                     *next_client = item;
@@ -791,7 +829,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 }
 
                 if sent {
-                    tracing::trace!("poll: subscriber message sent");
+                    tracing::trace!("{}|poll: subscriber message sent", id);
                     return Poll::Ready(());
                 }
 
@@ -812,6 +850,100 @@ mod test {
     pub fn setup_logging() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         // let _ = tracing_subscriber::fmt().try_init();
+    }
+
+    #[tokio::test]
+    async fn subscribers_shutdown_test() {
+        setup_logging();
+
+        let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+
+        let client = subs.add_client(0, true).await.unwrap();
+        tx.send("Hello World").await.unwrap();
+
+        let close_wait = subs.shutdown();
+
+        tokio::time::timeout(Duration::from_millis(100), close_wait).await
+            .expect("timeout waiting for close")
+            .expect("close handler dropped before send");
+        
+        drop(client);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn subscribers_close_no_subs_test() {
+        setup_logging();
+
+        let close_wait = {
+            let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+            tx.send("Hello World").await.unwrap();
+            subs.closed()
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), close_wait).await
+            .expect("timeout waiting for close")
+            .expect("close handler dropped before send");
+    }
+
+    #[tokio::test]
+    async fn subscribers_close_sub_caught_up_test() {
+        setup_logging();
+
+        let (close_wait, mut client) = {
+            let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+            tx.send("Hello World").await.unwrap();
+            let client = subs.add_client(0, true).await.unwrap();
+            (subs.closed(), client)
+        };
+
+        assert_eq!((0, "Hello World"), client.recv().await.unwrap());
+        drop(client);
+
+        tokio::time::timeout(Duration::from_millis(100), close_wait).await
+            .expect("timeout waiting for close")
+            .expect("close handler dropped before send");
+    }
+
+    #[tokio::test]
+    async fn subscribers_close_sub_caught_up_tx_alive_test() {
+        setup_logging();
+
+        let (close_wait, mut client, tx) = {
+            let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+            tx.send("Hello World").await.unwrap();
+            let client = subs.add_client(0, true).await.unwrap();
+            (subs.closed(), client, tx)
+        };
+
+        assert_eq!((0, "Hello World"), client.recv().await.unwrap());
+        drop(client);
+
+        tokio::time::timeout(Duration::from_millis(100), close_wait).await
+            .expect("timeout waiting for close")
+            .expect("close handler dropped before send");
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn subscribers_close_sub_not_caught_up_test() {
+        setup_logging();
+
+        let (close_wait, mut client) = {
+            let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+            tx.send("Hello World").await.unwrap();
+            tx.send("Hello World 2").await.unwrap();
+            let client = subs.add_client(0, true).await.unwrap();
+            (subs.closed(), client)
+        };
+
+        assert_eq!((0, "Hello World"), client.recv().await.unwrap());
+        drop(client);
+
+        tokio::time::timeout(Duration::from_millis(100), close_wait).await
+            .expect("timeout waiting for close")
+            .expect("close handler dropped before send");
     }
 
     #[tokio::test]
@@ -839,6 +971,8 @@ mod test {
         assert_eq!((2, "Hehe"), sub_1.recv().await.unwrap());
         assert_eq!((2, "Hehe"), sub_2.recv().await.unwrap());
         assert_eq!((2, "Hehe"), sub_3.recv().await.unwrap());
+
+        subs.shutdown_wait().await;
     }
 
     #[tokio::test]
@@ -873,6 +1007,8 @@ mod test {
 
         let total = read_task.await.unwrap();
         assert_eq!(total, count);
+
+        subs.shutdown_wait().await;
     }
 
     #[tokio::test]
@@ -900,6 +1036,8 @@ mod test {
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         tracing::info!("Metrics: {:?}", subs.metrics_ref());
+
+        subs.shutdown_wait().await;
     }
 
     #[tokio::test]
@@ -959,6 +1097,8 @@ mod test {
                 .is_ok()
         );
         assert_eq!(2000, sub.recv().await.unwrap().1);
+
+        subs.shutdown_wait().await;
     }
 
     #[tokio::test]
@@ -993,6 +1133,8 @@ mod test {
 
         assert_eq!((seq - 1, "Hello World"), sub.recv().await.unwrap());
         assert_eq!((seq, "Test"), sub.recv().await.unwrap());
+
+        subs.shutdown_wait().await;
     }
 
     #[tokio::test]
