@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque, fmt::Debug, future::{poll_fn, Future}, sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, LazyLock,
     }, task::Poll, time::{Duration, Instant}
 };
 
@@ -16,6 +16,7 @@ pub struct SequencedBroadcast<T> {
     new_client_tx: Sender<NewClient<T>>,
     metrics: Arc<SequencedBroadcastMetrics>,
     shutdown: CancellationToken,
+    worker_loops: Arc<AtomicU64>,
 }
 
 pub struct SequencedSender<T> {
@@ -38,6 +39,7 @@ pub struct SequencedBroadcastMetrics {
     pub active_subs_gauge: AtomicU64,
     pub min_sub_sequence_gauge: AtomicU64,
     pub disconnect_count: AtomicU64,
+    pub worker_loops: AtomicU64,
 }
 
 impl SequencedBroadcastMetrics {
@@ -50,6 +52,7 @@ impl SequencedBroadcastMetrics {
         self.active_subs_gauge.store(other.active_subs_gauge.load(Ordering::Acquire), Ordering::Release);
         self.min_sub_sequence_gauge.store(other.min_sub_sequence_gauge.load(Ordering::Acquire), Ordering::Release);
         self.disconnect_count.store(other.disconnect_count.load(Ordering::Acquire), Ordering::Release);
+        self.worker_loops.store(other.worker_loops.load(Ordering::Acquire), Ordering::Release);
     }
 }
 
@@ -85,6 +88,7 @@ struct Worker<T> {
     metrics: Arc<SequencedBroadcastMetrics>,
     settings: SequencedBroadcastSettings,
     shutdown: CancellationToken,
+    worker_loops: Arc<AtomicU64>,
 }
 
 impl Default for SequencedBroadcastSettings {
@@ -263,6 +267,8 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
         let shutdown = CancellationToken::new();
         let current_span = tracing::Span::current();
 
+        let worker_loops = Arc::new(AtomicU64::new(0));
+
         tokio::spawn(
             Worker {
                 rx: receiver.receiver,
@@ -278,6 +284,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
                 metrics: metrics.clone(),
                 settings,
                 shutdown: shutdown.clone(),
+                worker_loops: worker_loops.clone(),
             }
             .start()
             .instrument(current_span),
@@ -287,6 +294,7 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
             new_client_tx: client_tx,
             metrics,
             shutdown,
+            worker_loops,
         }
     }
 
@@ -317,6 +325,10 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
         self.metrics.clone()
     }
 
+    pub fn worker_loops(&self) -> u64 {
+        self.worker_loops.load(Ordering::Relaxed)
+    }
+
     pub fn shutdown(self) {
         self.shutdown.cancel();
     }
@@ -344,9 +356,22 @@ impl<T> Debug for NewClient<T> {
     }
 }
 
+static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(1)));
+
 impl<T: Send + Clone + 'static> Worker<T> {
-    async fn start(mut self) {
+    async fn start(self) {
+        let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(id, "SequencedBroadcastWorker Started");
+        let start = Instant::now();
+
+        self._start().await;
+        let elapsed = start.elapsed();
+        tracing::info!(id, ?elapsed, "SequencedBroadcastWorker Stopped");
+    }
+
+    async fn _start(mut self) {
         loop {
+            self.worker_loops.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
 
             if self.next_client.is_none() {
