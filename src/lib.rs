@@ -890,6 +890,29 @@ mod test {
     }
 
     #[tokio::test]
+    async fn subscribers_updates_active_metric_test() {
+        setup_logging();
+
+        let (subs, mut tx) = SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default());
+        tx.send("Hello World").await.unwrap();
+
+        let mut client_1 = subs.add_client(0, true).await.unwrap();
+        let mut client_2 = subs.add_client(0, true).await.unwrap();
+        let msg = client_1.recv().await.unwrap();
+        assert_eq!((0, "Hello World"), msg);
+
+        assert_eq!(2, subs.metrics_ref().active_subs_gauge.load(Ordering::Acquire));
+        drop(client_1);
+
+        tx.send("Test2").await.unwrap();
+        assert_eq!((0, "Hello World"), client_2.recv().await.unwrap());
+        assert_eq!((1, "Test2"), client_2.recv().await.unwrap());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(1, subs.metrics_ref().active_subs_gauge.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn subscribers_close_sub_caught_up_test() {
         setup_logging();
 
