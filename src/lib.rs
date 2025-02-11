@@ -99,7 +99,7 @@ struct Worker<T> {
 impl Default for SequencedBroadcastSettings {
     fn default() -> Self {
         SequencedBroadcastSettings {
-            subscriber_channel_len: 1024,
+            subscriber_channel_len: 32,
             lag_start_threshold: 1024 * 8,
             lag_end_threshold: 1024 * 4,
             max_time_lag: Duration::from_secs(2),
@@ -253,11 +253,11 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
     }
 
     pub fn new2(receiver: SequencedReceiver<T>, settings: SequencedBroadcastSettings) -> Self {
-        let queue_cap = ((settings.lag_start_threshold as usize)
+        let queue_cap = 2 * (
+            (settings.lag_start_threshold as usize)
             .next_power_of_two()
             .max(1024)
-            * 2)
-        .max((settings.min_history as usize).next_power_of_two());
+        ).max((settings.min_history as usize).next_power_of_two());
 
         assert!(settings.lag_end_threshold <= settings.lag_start_threshold);
 
@@ -528,7 +528,10 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     break 'fill_rx;
                 }
 
-                self.rx_full = false;
+                if self.rx_full {
+                    tracing::info!("{}|Space returned to queue {}/{}", id, self.rx_space(), self.queue.len());
+                    self.rx_full = false;
+                }
 
                 while let Some((seq, item)) = self.next_rx.take() {
                     self.next_rx = self.rx.try_recv().ok();
@@ -1138,7 +1141,57 @@ mod test {
     }
 
     #[tokio::test]
-    async fn subscribers_drops_slow_sub() {
+    async fn continious_send_send_test() {
+        setup_logging();
+
+        let (subs, mut tx) = SequencedBroadcast::<u64>::new(1, SequencedBroadcastSettings {
+            min_history: 1024,
+            lag_end_threshold: 128,
+            lag_start_threshold: 512,
+            max_time_lag: Duration::from_secs(20),
+            ..Default::default()
+        });
+
+        let mut read_tasks = vec![];
+        for _ in 0..32 {
+            let mut client = subs.add_client(1, true).await.unwrap();
+
+            let read_task = tokio::spawn(async move {
+                let mut next = 1;
+                while let Some((seq, num)) = client.recv().await {
+                    assert_eq!(seq, num);
+                    assert_eq!(seq, next);
+                    next = seq + 1;
+                }
+                next
+            });
+
+            read_tasks.push(read_task);
+        }
+
+        let start = Instant::now();
+        let mut end = 1;
+        while start.elapsed() < Duration::from_secs(5) {
+            tokio::time::timeout(Duration::from_secs(1), tx.send(end)).await
+                .expect("timeout sending message")
+                .expect("failed to send message");
+
+            end += 1;
+        }
+
+        drop(tx);
+
+        for read_task in read_tasks {
+            let count = tokio::time::timeout(Duration::from_secs(1), read_task).await
+                .expect("timeout waiting for rx task to close")
+                .expect("rx task crashed");
+
+            assert_eq!(count, end);
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribers_drops_slow_sub_test() {
         setup_logging();
 
         let (subs, mut tx) = SequencedBroadcast::<i64>::new(
