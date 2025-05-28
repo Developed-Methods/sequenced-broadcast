@@ -5,6 +5,7 @@ use std::{
     }, task::Poll, time::{Duration, Instant}
 };
 
+use arc_metrics::{IntCounter, IntGauge};
 use tokio::sync::{
     mpsc::{channel, error::{SendError, TryRecvError, TrySendError}, Permit, Receiver, Sender},
     oneshot,
@@ -30,31 +31,17 @@ pub struct SequencedReceiver<T> {
     receiver: Receiver<(u64, T)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default, Debug)]
 pub struct SequencedBroadcastMetrics {
-    pub oldest_sequence: AtomicU64,
-    pub next_sequence: AtomicU64,
-    pub new_client_drop_count: AtomicU64,
-    pub new_client_accept_count: AtomicU64,
-    pub lagging_subs_gauge: AtomicU64,
-    pub active_subs_gauge: AtomicU64,
-    pub min_sub_sequence_gauge: AtomicU64,
-    pub disconnect_count: AtomicU64,
-    pub worker_loops: AtomicU64,
-}
-
-impl SequencedBroadcastMetrics {
-    pub fn update(&self, other: &Self) {
-        self.oldest_sequence.store(other.oldest_sequence.load(Ordering::Acquire), Ordering::Release);
-        self.next_sequence.store(other.next_sequence.load(Ordering::Acquire), Ordering::Release);
-        self.new_client_drop_count.store(other.new_client_drop_count.load(Ordering::Acquire), Ordering::Release);
-        self.new_client_accept_count.store(other.new_client_accept_count.load(Ordering::Acquire), Ordering::Release);
-        self.lagging_subs_gauge.store(other.lagging_subs_gauge.load(Ordering::Acquire), Ordering::Release);
-        self.active_subs_gauge.store(other.active_subs_gauge.load(Ordering::Acquire), Ordering::Release);
-        self.min_sub_sequence_gauge.store(other.min_sub_sequence_gauge.load(Ordering::Acquire), Ordering::Release);
-        self.disconnect_count.store(other.disconnect_count.load(Ordering::Acquire), Ordering::Release);
-        self.worker_loops.store(other.worker_loops.load(Ordering::Acquire), Ordering::Release);
-    }
+    pub oldest_sequence: IntGauge,
+    pub next_sequence: IntGauge,
+    pub new_client_drop_count: IntCounter,
+    pub new_client_accept_count: IntCounter,
+    pub lagging_subs_gauge: IntGauge,
+    pub active_subs_gauge: IntGauge,
+    pub min_sub_sequence_gauge: IntGauge,
+    pub disconnect_count: IntCounter,
+    pub worker_loops: IntCounter,
 }
 
 struct Subscriber<T> {
@@ -174,7 +161,7 @@ pub struct SequencedSenderPermit<'a, T> {
     permit: Permit<'a, (u64, T)>,
 }
 
-impl<'a, T> SequencedSenderPermit<'a, T> {
+impl<T> SequencedSenderPermit<'_, T> {
     pub fn send(self, item: T) {
         let seq = *self.next_seq;
         self.permit.send((seq, item));
@@ -264,8 +251,16 @@ impl<T: Send + Clone + 'static> SequencedBroadcast<T> {
         let (client_tx, client_rx) = channel(32);
 
         let metrics = Arc::new(SequencedBroadcastMetrics {
-            oldest_sequence: AtomicU64::new(receiver.next_seq),
-            next_sequence: AtomicU64::new(receiver.next_seq),
+            oldest_sequence: {
+                let i = IntGauge::default();
+                i.set(receiver.next_seq);
+                i
+            },
+            next_sequence: {
+                let i = IntGauge::default();
+                i.set(receiver.next_seq);
+                i
+            },
             ..Default::default()
         });
 
@@ -430,9 +425,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     if new.next_sequence < min_allowed_seq
                         || self.next_queue_seq < new.next_sequence
                     {
-                        self.metrics
-                            .new_client_drop_count
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.new_client_drop_count.inc();
 
                         if new.next_sequence < min_allowed_seq {
                             tracing::info!(
@@ -463,9 +456,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                         continue;
                     }
 
-                    self.metrics
-                        .new_client_accept_count
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.new_client_accept_count.inc();
 
                     /* Send Receiver to subscribers */
                     let (tx, rx) = channel(self.settings.subscriber_channel_len);
@@ -547,9 +538,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                 }
             }
 
-            self.metrics
-                .next_sequence
-                .store(self.next_queue_seq, Ordering::Relaxed);
+            self.metrics.next_sequence.set(self.next_queue_seq);
 
             let oldest_queue_sequence = self
                 .queue
@@ -583,14 +572,10 @@ impl<T: Send + Clone + 'static> Worker<T> {
                     }
 
                     if sub.lag_started_at.is_some() {
-                        self.metrics
-                            .lagging_subs_gauge
-                            .fetch_sub(1, Ordering::Relaxed);
+                        self.metrics.lagging_subs_gauge.dec();
                     }
 
-                    self.metrics
-                        .disconnect_count
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.disconnect_count.inc();
 
                     self.subscribers.swap_remove(i);
                     continue 'next_sub;
@@ -652,9 +637,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                                 lag_start.elapsed()
                             );
 
-                            self.metrics
-                                .lagging_subs_gauge
-                                .fetch_sub(1, Ordering::Relaxed);
+                            self.metrics.lagging_subs_gauge.inc();
                         }
                     }
                     else if sub.next_sequence < lag_start_seq {
@@ -669,13 +652,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                                     lag_duration,
                                 );
 
-                                self.metrics
-                                    .lagging_subs_gauge
-                                    .fetch_sub(1, Ordering::Relaxed);
-
-                                self.metrics
-                                    .disconnect_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.lagging_subs_gauge.dec();
+                                self.metrics.disconnect_count.inc();
 
                                 self.subscribers.swap_remove(i);
                                 continue 'next_sub;
@@ -691,10 +669,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
                                 max_seq - sub.next_sequence,
                             );
 
-                            self.metrics
-                                .lagging_subs_gauge
-                                .fetch_add(1, Ordering::Relaxed);
-                            }
+                            self.metrics.lagging_subs_gauge.inc()
+                        }
                     }
                 }
 
@@ -711,13 +687,8 @@ impl<T: Send + Clone + 'static> Worker<T> {
 
             let min_sub_sequence = min_sub_sequence_calc;
 
-            self.metrics
-                .active_subs_gauge
-                .store(self.subscribers.len() as u64, Ordering::Relaxed);
-
-            self.metrics
-                .min_sub_sequence_gauge
-                .store(min_sub_sequence, Ordering::Relaxed);
+            self.metrics.active_subs_gauge.set(self.subscribers.len() as u64);
+            self.metrics.min_sub_sequence_gauge.set(min_sub_sequence);
 
             /* trim rx queue */
             {
@@ -729,9 +700,7 @@ impl<T: Send + Clone + 'static> Worker<T> {
                         let _ = self.queue.drain(0..remove_count as usize);
                     }
 
-                    self.metrics
-                        .oldest_sequence
-                        .store(oldest_queue_sequence + remove_count, Ordering::Relaxed);
+                    self.metrics.oldest_sequence.set(oldest_queue_sequence + remove_count);
                 }
             }
 
@@ -901,7 +870,7 @@ mod test {
         let msg = client_1.recv().await.unwrap();
         assert_eq!((0, "Hello World"), msg);
 
-        assert_eq!(2, subs.metrics_ref().active_subs_gauge.load(Ordering::Acquire));
+        assert_eq!(2, subs.metrics_ref().active_subs_gauge.load());
         drop(client_1);
 
         tx.send("Test2").await.unwrap();
@@ -909,7 +878,7 @@ mod test {
         assert_eq!((1, "Test2"), client_2.recv().await.unwrap());
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(1, subs.metrics_ref().active_subs_gauge.load(Ordering::Acquire));
+        assert_eq!(1, subs.metrics_ref().active_subs_gauge.load());
     }
 
     #[tokio::test]
@@ -1140,7 +1109,7 @@ mod test {
 
             tracing::info!("Sent 1M messages");
 
-            while tx.seq() != subs.metrics_ref().next_sequence.load(Ordering::Relaxed) {
+            while tx.seq() != subs.metrics_ref().next_sequence.load() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
