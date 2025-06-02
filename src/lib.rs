@@ -212,10 +212,19 @@ impl<T> SequencedReceiver<T> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum SequencedSenderError<T> {
     InvalidSequence(u64, T),
     ChannelClosed(T),
+}
+
+impl<T> Debug for SequencedSenderError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSequence(seq, _) => write!(f, "InvalidSequence(seq: {})", seq),
+            Self::ChannelClosed(_) => write!(f, "ChannelClosed"),
+        }
+    }
 }
 
 impl<T> SequencedSenderError<T> {
