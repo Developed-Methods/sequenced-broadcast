@@ -1,13 +1,13 @@
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use arc_metrics::{IntCounter, IntGauge};
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{Notify, RwLock, broadcast};
 
 pub struct SequencedBroadcast<T> {
     state: Arc<State<T>>,
@@ -520,7 +520,7 @@ mod test {
     use super::*;
     use tokio::{
         task::JoinHandle,
-        time::{sleep, timeout, Duration, Instant},
+        time::{Duration, Instant, sleep, timeout},
     };
 
     fn settings(history_capacity: usize, broadcast_capacity: usize) -> SequencedBroadcastSettings {
@@ -769,9 +769,11 @@ mod test {
             SequencedBroadcast::<&'static str>::new(0, SequencedBroadcastSettings::default())
                 .expect("valid settings");
 
-        assert!(timeout(Duration::from_millis(10), subs.closed())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(10), subs.closed())
+                .await
+                .is_err()
+        );
         tx.close();
         timeout(Duration::from_millis(10), subs.closed())
             .await
