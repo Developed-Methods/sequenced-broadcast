@@ -234,8 +234,13 @@ where
     }
 
     pub async fn closed(&self) {
-        while !self.is_closed() {
-            self.state.close_notify.notified().await;
+        loop {
+            let notified = self.state.close_notify.notified();
+            if self.is_closed() {
+                return;
+            }
+
+            notified.await;
         }
     }
 }
@@ -250,8 +255,13 @@ impl<T> SequencedSender<T> {
     }
 
     pub async fn closed(&self) {
-        while !self.is_closed() {
-            self.state.close_notify.notified().await;
+        loop {
+            let notified = self.state.close_notify.notified();
+            if self.is_closed() {
+                return;
+            }
+
+            notified.await;
         }
     }
 
@@ -508,7 +518,10 @@ impl From<SequencedRecvError> for SequencedTryRecvError {
 #[cfg(test)]
 mod test {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::{
+        task::JoinHandle,
+        time::{sleep, timeout, Duration, Instant},
+    };
 
     fn settings(history_capacity: usize, broadcast_capacity: usize) -> SequencedBroadcastSettings {
         SequencedBroadcastSettings {
@@ -790,5 +803,188 @@ mod test {
             Err(error) => error,
         };
         assert_eq!(err, SettingsError::ZeroBroadcastCapacity);
+    }
+
+    #[derive(Clone)]
+    struct FuzzRng {
+        state: u64,
+    }
+
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.state
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            if upper == 0 {
+                return 0;
+            }
+
+            (self.next() as usize) % upper
+        }
+
+        fn one_in(&mut self, denominator: usize) -> bool {
+            self.range(denominator) == 0
+        }
+    }
+
+    async fn run_fuzz_receiver(mut rx: SequencedReceiver<u64>, mut rng: FuzzRng) -> u64 {
+        let mut received = 0;
+
+        loop {
+            if rng.one_in(3) {
+                let expected = rx.next_seq();
+                match rx.try_recv() {
+                    Ok((seq, item)) => {
+                        assert_eq!(seq, expected);
+                        assert_eq!(item, seq);
+                        received += 1;
+                    }
+                    Err(SequencedTryRecvError::Empty) => {
+                        sleep(Duration::from_micros((rng.range(500) + 1) as u64)).await;
+                    }
+                    Err(SequencedTryRecvError::Closed)
+                    | Err(SequencedTryRecvError::Lagged { .. }) => break,
+                }
+            } else {
+                let expected = rx.next_seq();
+                match timeout(Duration::from_millis(50), rx.recv()).await {
+                    Ok(Ok((seq, item))) => {
+                        assert_eq!(seq, expected);
+                        assert_eq!(item, seq);
+                        received += 1;
+                    }
+                    Ok(Err(SequencedRecvError::Closed))
+                    | Ok(Err(SequencedRecvError::Lagged { .. })) => break,
+                    Err(_) => {}
+                }
+            }
+
+            if received != 0 && rng.one_in(128) {
+                break;
+            }
+
+            if rng.one_in(8) {
+                sleep(Duration::from_micros((rng.range(1_000) + 1) as u64)).await;
+            }
+        }
+
+        received
+    }
+
+    async fn join_finished(tasks: &mut Vec<JoinHandle<u64>>) -> u64 {
+        let mut received = 0;
+
+        while let Some(pos) = tasks.iter().position(JoinHandle::is_finished) {
+            received += tasks
+                .swap_remove(pos)
+                .await
+                .expect("fuzz receiver task panicked");
+        }
+
+        received
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "30 second fuzzy stability test; run with `cargo test fuzzy_stability_30_seconds -- --ignored`"]
+    async fn fuzzy_stability_30_seconds() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (subs, mut tx) = SequencedBroadcast::new(0, settings(512, 64)).expect("valid settings");
+        let sender_deadline = deadline;
+
+        let sender = tokio::spawn(async move {
+            let mut rng = FuzzRng::new(0xa511_ce5d_f00d);
+            let mut sent = 0;
+
+            while Instant::now() < sender_deadline {
+                let seq = tx.seq();
+                let sent_seq = tx
+                    .send(seq)
+                    .await
+                    .expect("send should succeed before close");
+                assert_eq!(sent_seq, seq);
+                sent += 1;
+
+                if rng.one_in(4) {
+                    tokio::task::yield_now().await;
+                }
+
+                if rng.one_in(16) {
+                    sleep(Duration::from_micros((rng.range(250) + 1) as u64)).await;
+                }
+            }
+
+            tx.close();
+            sent
+        });
+
+        let mut rng = FuzzRng::new(0x5eed_5eed_cafe);
+        let mut tasks: Vec<JoinHandle<u64>> = Vec::new();
+        let mut total_received = 0;
+
+        while Instant::now() < deadline {
+            total_received += join_finished(&mut tasks).await;
+
+            if tasks.len() < 128 {
+                let history = subs.state.history.read().await;
+                let oldest = history.oldest_seq;
+                let next = history.next_seq;
+                drop(history);
+
+                let valid_span = next.saturating_sub(oldest) + 1;
+                let seq = oldest + rng.range(valid_span as usize) as u64;
+
+                match subs.subscribe_from(seq).await {
+                    Ok(rx) => {
+                        let seed = rng.next();
+                        tasks.push(tokio::spawn(run_fuzz_receiver(rx, FuzzRng::new(seed))));
+                    }
+                    Err(SubscribeError::SequenceTooFarBehind { .. })
+                    | Err(SubscribeError::SequenceTooFarAhead { .. }) => {}
+                    Err(SubscribeError::Closed) => break,
+                }
+            }
+
+            if rng.one_in(4) {
+                let history = subs.state.history.read().await;
+                let too_old = history.oldest_seq.saturating_sub(1);
+                let too_new = history.next_seq.saturating_add(1_000);
+                let oldest = history.oldest_seq;
+                drop(history);
+
+                if oldest != 0 {
+                    assert!(matches!(
+                        subs.subscribe_from(too_old).await,
+                        Err(SubscribeError::SequenceTooFarBehind { .. })
+                    ));
+                }
+
+                assert!(matches!(
+                    subs.subscribe_from(too_new).await,
+                    Err(SubscribeError::SequenceTooFarAhead { .. })
+                ));
+            }
+
+            sleep(Duration::from_millis((rng.range(5) + 1) as u64)).await;
+        }
+
+        let sent = sender.await.expect("fuzz sender task panicked");
+
+        for task in tasks {
+            total_received += task.await.expect("fuzz receiver task panicked");
+        }
+
+        assert!(sent > 1_000);
+        assert!(total_received > 0);
+        assert_eq!(subs.metrics_ref().next_sequence.load(), sent);
+        assert_eq!(subs.metrics_ref().active_subs_gauge.load(), 0);
     }
 }
