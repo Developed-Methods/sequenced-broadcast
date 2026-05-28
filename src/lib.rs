@@ -288,14 +288,15 @@ where
             return Err(SequencedSenderError::Closed(item));
         }
 
-        let message = SequencedItem { seq, item };
-        history.entries.push_back(message.clone());
-        history.next_seq += 1;
-
-        while history.capacity < history.entries.len() {
+        /* note, do capacity check before push to ensure we don't allocate more memory */
+        if history.capacity <= history.entries.len() {
             history.entries.pop_front();
             history.oldest_seq += 1;
         }
+
+        let message = SequencedItem { seq, item };
+        history.entries.push_back(message.clone());
+        history.next_seq += 1;
 
         self.state.metrics.oldest_sequence.set(history.oldest_seq);
         self.state.metrics.next_sequence.set(history.next_seq);
@@ -375,7 +376,7 @@ where
         }
 
         loop {
-            if let Some(item) = self.pop_replay().map_err(SequencedTryRecvError::from)? {
+            if let Some(item) = self.pop_replay()? {
                 return Ok(item);
             }
 
