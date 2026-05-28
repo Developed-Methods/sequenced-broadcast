@@ -1,20 +1,15 @@
 [package]
 name = "sequenced-broadcast"
-version = "0.2.6"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 authors = ["Patrick Lorio <patrick@methods.dev>"]
 description = "Async structure to allow sequenced broadcasts with history"
 repository = "https://github.com/Developed-Methods/sequenced-broadcast"
 license = "BSD-2-Clause"
-license-file = "LICENSE.txt"
 
 [dependencies]
-tokio = { version = "1.40", features = ["time", "sync", "rt"] }
-tokio-util = "0.7.12"
-tracing = "0.1.40"
+tokio = { version = "1.40", features = ["macros", "sync"] }
 arc-metrics = "0.1"
 
 [dev-dependencies]
-tracing-subscriber = "0.3.18"
 tokio = { version = "1.40", features = ["full"] }
-
